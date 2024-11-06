@@ -8,7 +8,8 @@ javac Main.java
 
 go build main.go
 
-if [[ "$OSTYPE" == "darwin"* ]]; then
+# Not all platforms support Swift
+if [[ "$OSTYPE" == "darwin"* && -z "$CODEQL_NO_SWIFT_COMPILATION" ]]; then
     swift build
 fi
 
