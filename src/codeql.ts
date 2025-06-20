@@ -280,7 +280,7 @@ let cachedCodeQL: CodeQL | undefined = undefined;
  * The version flags below can be used to conditionally enable certain features
  * on versions newer than this.
  */
-const CODEQL_MINIMUM_VERSION = "2.15.5";
+const CODEQL_MINIMUM_VERSION = "2.16.6";
 
 /**
  * This version will shortly become the oldest version of CodeQL that the Action will run with.
@@ -570,20 +570,6 @@ export async function getCodeQLForCmd(
         extraArgs.push(`--trace-process-name=${processName}`);
       }
 
-      if (config.languages.indexOf(Language.actions) >= 0) {
-        // We originally added an embedded version of the Actions extractor to the CodeQL Action
-        // itself in order to deploy the extractor between CodeQL releases. When we did add the
-        // extractor to the CLI, though, its autobuild script was missing the execute bit.
-        // 2.20.6 is the first CLI release with the fully-functional extractor in the CLI. For older
-        // versions, we'll keep using the embedded extractor. We can remove the embedded extractor
-        // once 2.20.6 is deployed in the runner images.
-        if (!(await util.codeQlVersionAtLeast(codeql, "2.20.6"))) {
-          extraArgs.push("--search-path");
-          const extractorPath = path.resolve(__dirname, "../actions-extractor");
-          extraArgs.push(extractorPath);
-        }
-      }
-
       const codeScanningConfigFile = await generateCodeScanningConfig(
         config,
         logger,
@@ -596,10 +582,7 @@ export async function getCodeQLForCmd(
         extraArgs.push("--external-repository-token-stdin");
       }
 
-      if (
-        config.buildMode !== undefined &&
-        (await this.supportsFeature(ToolsFeature.BuildModeOption))
-      ) {
+      if (config.buildMode !== undefined) {
         extraArgs.push(`--build-mode=${config.buildMode}`);
       }
       if (qlconfigFile !== undefined) {
@@ -1236,13 +1219,20 @@ async function generateCodeScanningConfig(
   const augmentedConfig = cloneObject(config.originalUserInput);
 
   // Inject the queries from the input
-  if (config.augmentationProperties.queriesInput) {
+  if (
+    config.augmentationProperties.queriesInput ||
+    config.augmentationProperties.qualityQueriesInput
+  ) {
+    const queryInputs = (
+      config.augmentationProperties.queriesInput || []
+    ).concat(config.augmentationProperties.qualityQueriesInput || []);
+
     if (config.augmentationProperties.queriesInputCombines) {
       augmentedConfig.queries = (augmentedConfig.queries || []).concat(
-        config.augmentationProperties.queriesInput,
+        queryInputs,
       );
     } else {
-      augmentedConfig.queries = config.augmentationProperties.queriesInput;
+      augmentedConfig.queries = queryInputs;
     }
   }
   if (augmentedConfig.queries?.length === 0) {
@@ -1276,8 +1266,12 @@ async function generateCodeScanningConfig(
   }
 
   augmentedConfig["query-filters"] = [
-    ...(config.augmentationProperties.defaultQueryFilters || []),
+    // Ordering matters. If the first filter is an inclusion, it implicitly
+    // excludes all queries that are not included. If it is an exclusion,
+    // it implicitly includes all queries that are not excluded. So user
+    // filters (if any) should always be first to preserve intent.
     ...(augmentedConfig["query-filters"] || []),
+    ...(config.augmentationProperties.extraQueryExclusions || []),
   ];
   if (augmentedConfig["query-filters"]?.length === 0) {
     delete augmentedConfig["query-filters"];
