@@ -16,7 +16,7 @@ import { CodeQL, getCodeQL } from "./codeql";
 import { getConfig } from "./config-utils";
 import { readDiffRangesJsonFile } from "./diff-informed-analysis-utils";
 import { EnvVar } from "./environment";
-import { FeatureEnablement } from "./feature-flags";
+import { Feature, FeatureEnablement } from "./feature-flags";
 import * as fingerprints from "./fingerprints";
 import * as gitUtils from "./git-utils";
 import { initCodeQL } from "./init";
@@ -145,6 +145,58 @@ export async function shouldShowCombineSarifFilesDeprecationWarning(
   );
 }
 
+export async function throwIfCombineSarifFilesDisabled(
+  sarifObjects: util.SarifFile[],
+  features: FeatureEnablement,
+  githubVersion: GitHubVersion,
+) {
+  if (
+    !(await shouldDisableCombineSarifFiles(
+      sarifObjects,
+      features,
+      githubVersion,
+    ))
+  ) {
+    return;
+  }
+
+  // TODO: Update this changelog URL to the correct one when it's published.
+  const deprecationMoreInformationMessage =
+    "For more information, see https://github.blog/changelog/2024-05-06-code-scanning-will-stop-combining-runs-from-a-single-upload";
+
+  throw new ConfigurationError(
+    `The CodeQL Action does not support uploading multiple SARIF runs with the same category. Please update your workflow to upload a single run per category. ${deprecationMoreInformationMessage}`,
+  );
+}
+
+// Checks whether combining SARIF files should be disabled.
+async function shouldDisableCombineSarifFiles(
+  sarifObjects: util.SarifFile[],
+  features: FeatureEnablement,
+  githubVersion: GitHubVersion,
+) {
+  if (githubVersion.type === GitHubVariant.GHES) {
+    // Never block on GHES versions before 3.18.
+    if (semver.lt(githubVersion.version, "3.18.0-0")) {
+      return false;
+    }
+  } else {
+    // Never block when the feature flag is disabled.
+    if (!(await features.getValue(Feature.DisableCombineSarifFiles))) {
+      return false;
+    }
+  }
+
+  if (areAllRunsUnique(sarifObjects)) {
+    // If all runs are unique, we can safely combine them.
+    return false;
+  }
+
+  // Combining SARIF files is not supported and Code Scanning will return an
+  // error if multiple runs with the same category are uploaded.
+  return true;
+}
+
 // Takes a list of paths to sarif files and combines them together using the
 // CLI `github merge-results` command when all SARIF files are produced by
 // CodeQL. Otherwise, it will fall back to combining the files in the action.
@@ -167,11 +219,17 @@ async function combineSarifFilesUsingCLI(
   const deprecationWarningMessage =
     gitHubVersion.type === GitHubVariant.GHES
       ? "and will be removed in GitHub Enterprise Server 3.18"
-      : "and will be removed on June 4, 2025";
+      : "and will be removed in July 2025";
   const deprecationMoreInformationMessage =
     "For more information, see https://github.blog/changelog/2024-05-06-code-scanning-will-stop-combining-runs-from-a-single-upload";
 
   if (!areAllRunsProducedByCodeQL(sarifObjects)) {
+    await throwIfCombineSarifFilesDisabled(
+      sarifObjects,
+      features,
+      gitHubVersion,
+    );
+
     logger.debug(
       "Not all SARIF files were produced by CodeQL. Merging files in the action.",
     );
@@ -235,6 +293,12 @@ async function combineSarifFilesUsingCLI(
       ToolsFeature.SarifMergeRunsFromEqualCategory,
     ))
   ) {
+    await throwIfCombineSarifFilesDisabled(
+      sarifObjects,
+      features,
+      gitHubVersion,
+    );
+
     logger.warning(
       "The CodeQL CLI does not support merging SARIF files. Merging files in the action.",
     );
@@ -306,12 +370,19 @@ function getAutomationID(
   return api.computeAutomationID(analysis_key, environment);
 }
 
+// Enumerates API endpoints that accept SARIF files.
+export enum SARIF_UPLOAD_ENDPOINT {
+  CODE_SCANNING = "PUT /repos/:owner/:repo/code-scanning/analysis",
+  CODE_QUALITY = "PUT /repos/:owner/:repo/code-quality/analysis",
+}
+
 // Upload the given payload.
 // If the request fails then this will retry a small number of times.
 async function uploadPayload(
   payload: any,
   repositoryNwo: RepositoryNwo,
   logger: Logger,
+  target: SARIF_UPLOAD_ENDPOINT,
 ): Promise<string> {
   logger.info("Uploading results");
 
@@ -332,14 +403,11 @@ async function uploadPayload(
   const client = api.getApiClient();
 
   try {
-    const response = await client.request(
-      "PUT /repos/:owner/:repo/code-scanning/analysis",
-      {
-        owner: repositoryNwo.owner,
-        repo: repositoryNwo.repo,
-        data: payload,
-      },
-    );
+    const response = await client.request(target, {
+      owner: repositoryNwo.owner,
+      repo: repositoryNwo.repo,
+      data: payload,
+    });
 
     logger.debug(`response status: ${response.status}`);
     logger.info("Successfully uploaded results");
@@ -378,12 +446,15 @@ export interface UploadResult {
 
 // Recursively walks a directory and returns all SARIF files it finds.
 // Does not follow symlinks.
-export function findSarifFilesInDir(sarifPath: string): string[] {
+export function findSarifFilesInDir(
+  sarifPath: string,
+  isSarif: (name: string) => boolean,
+): string[] {
   const sarifFiles: string[] = [];
   const walkSarifFiles = (dir: string) => {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.isFile() && entry.name.endsWith(".sarif")) {
+      if (entry.isFile() && isSarif(entry.name)) {
         sarifFiles.push(path.resolve(dir, entry.name));
       } else if (entry.isDirectory()) {
         walkSarifFiles(path.resolve(dir, entry.name));
@@ -394,7 +465,10 @@ export function findSarifFilesInDir(sarifPath: string): string[] {
   return sarifFiles;
 }
 
-function getSarifFilePaths(sarifPath: string) {
+export function getSarifFilePaths(
+  sarifPath: string,
+  isSarif: (name: string) => boolean,
+) {
   if (!fs.existsSync(sarifPath)) {
     // This is always a configuration error, even for first-party runs.
     throw new ConfigurationError(`Path does not exist: ${sarifPath}`);
@@ -402,7 +476,7 @@ function getSarifFilePaths(sarifPath: string) {
 
   let sarifFiles: string[];
   if (fs.lstatSync(sarifPath).isDirectory()) {
-    sarifFiles = findSarifFilesInDir(sarifPath);
+    sarifFiles = findSarifFilesInDir(sarifPath, isSarif);
     if (sarifFiles.length === 0) {
       // This is always a configuration error, even for first-party runs.
       throw new ConfigurationError(
@@ -567,6 +641,31 @@ export function buildPayload(
   return payloadObj;
 }
 
+// Represents configurations for different services that we can upload SARIF to.
+export interface UploadTarget {
+  name: string;
+  target: SARIF_UPLOAD_ENDPOINT;
+  sarifPredicate: (name: string) => boolean;
+  sentinelPrefix: string;
+}
+
+// Represents the Code Scanning upload target.
+export const CodeScanningTarget: UploadTarget = {
+  name: "code scanning",
+  target: SARIF_UPLOAD_ENDPOINT.CODE_SCANNING,
+  sarifPredicate: (name) =>
+    name.endsWith(".sarif") && !CodeQualityTarget.sarifPredicate(name),
+  sentinelPrefix: "CODEQL_UPLOAD_SARIF_",
+};
+
+// Represents the Code Quality upload target.
+export const CodeQualityTarget: UploadTarget = {
+  name: "code quality",
+  target: SARIF_UPLOAD_ENDPOINT.CODE_QUALITY,
+  sarifPredicate: (name) => name.endsWith(".quality.sarif"),
+  sentinelPrefix: "CODEQL_UPLOAD_QUALITY_SARIF_",
+};
+
 /**
  * Uploads a single SARIF file or a directory of SARIF files depending on what `inputSarifPath` refers
  * to.
@@ -577,10 +676,35 @@ export async function uploadFiles(
   category: string | undefined,
   features: FeatureEnablement,
   logger: Logger,
+  uploadTarget: UploadTarget,
 ): Promise<UploadResult> {
-  const sarifPaths = getSarifFilePaths(inputSarifPath);
+  const sarifPaths = getSarifFilePaths(
+    inputSarifPath,
+    uploadTarget.sarifPredicate,
+  );
 
-  logger.startGroup("Uploading results");
+  return uploadSpecifiedFiles(
+    sarifPaths,
+    checkoutPath,
+    category,
+    features,
+    logger,
+    uploadTarget,
+  );
+}
+
+/**
+ * Uploads the given array of SARIF files.
+ */
+export async function uploadSpecifiedFiles(
+  sarifPaths: string[],
+  checkoutPath: string,
+  category: string | undefined,
+  features: FeatureEnablement,
+  logger: Logger,
+  uploadTarget: UploadTarget = CodeScanningTarget,
+): Promise<UploadResult> {
+  logger.startGroup(`Uploading ${uploadTarget.name} results`);
   logger.info(`Processing sarif files: ${JSON.stringify(sarifPaths)}`);
 
   const gitHubVersion = await getGitHubVersion();
@@ -621,7 +745,7 @@ export async function uploadFiles(
   const toolNames = util.getToolNames(sarif);
 
   logger.debug(`Validating that each SARIF run has a unique category`);
-  validateUniqueCategory(sarif);
+  validateUniqueCategory(sarif, uploadTarget.sentinelPrefix);
   logger.debug(`Serializing SARIF for upload`);
   const sarifPayload = JSON.stringify(sarif);
   logger.debug(`Compressing serialized SARIF`);
@@ -651,7 +775,12 @@ export async function uploadFiles(
   logger.debug(`Number of results in upload: ${numResultInSarif}`);
 
   // Make the upload
-  const sarifID = await uploadPayload(payload, getRepositoryNwo(), logger);
+  const sarifID = await uploadPayload(
+    payload,
+    getRepositoryNwo(),
+    logger,
+    uploadTarget.target,
+  );
 
   logger.endGroup();
 
@@ -833,7 +962,10 @@ function handleProcessingResultForUnsuccessfulExecution(
   }
 }
 
-export function validateUniqueCategory(sarif: SarifFile): void {
+export function validateUniqueCategory(
+  sarif: SarifFile,
+  sentinelPrefix: string = CodeScanningTarget.sentinelPrefix,
+): void {
   // duplicate categories are allowed in the same sarif file
   // but not across multiple sarif files
   const categories = {} as Record<string, { id?: string; tool?: string }>;
@@ -846,7 +978,7 @@ export function validateUniqueCategory(sarif: SarifFile): void {
   }
 
   for (const [category, { id, tool }] of Object.entries(categories)) {
-    const sentinelEnvVar = `CODEQL_UPLOAD_SARIF_${category}`;
+    const sentinelEnvVar = `${sentinelPrefix}${category}`;
     if (process.env[sentinelEnvVar]) {
       // This is always a configuration error, even for first-party runs.
       throw new ConfigurationError(

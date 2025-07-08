@@ -7,6 +7,7 @@ import { getApiClient } from "./api-client";
 import type { CodeQL } from "./codeql";
 import * as defaults from "./defaults.json";
 import { Logger } from "./logging";
+import { CODEQL_OVERLAY_MINIMUM_VERSION } from "./overlay-database-utils";
 import { RepositoryNwo } from "./repository";
 import { ToolsFeature } from "./tools-features";
 import * as util from "./util";
@@ -46,11 +47,13 @@ export enum Feature {
   CppBuildModeNone = "cpp_build_mode_none",
   CppDependencyInstallation = "cpp_dependency_installation_enabled",
   DiffInformedQueries = "diff_informed_queries",
+  DisableCombineSarifFiles = "disable_combine_sarif_files",
   DisableCsharpBuildless = "disable_csharp_buildless",
   DisableJavaBuildlessEnabled = "disable_java_buildless_enabled",
   DisableKotlinAnalysisEnabled = "disable_kotlin_analysis_enabled",
   ExportDiagnosticsEnabled = "export_diagnostics_enabled",
   ExtractToToolcache = "extract_to_toolcache",
+  OverlayAnalysis = "overlay_analysis",
   PythonDefaultIsToNotExtractStdlib = "python_default_is_to_not_extract_stdlib",
   QaTelemetryEnabled = "qa_telemetry_enabled",
   RustAnalysis = "rust_analysis",
@@ -114,6 +117,11 @@ export const featureConfig: Record<
     envVar: "CODEQL_ACTION_DIFF_INFORMED_QUERIES",
     minimumVersion: "2.21.0",
   },
+  [Feature.DisableCombineSarifFiles]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_DISABLE_COMBINE_SARIF_FILES",
+    minimumVersion: undefined,
+  },
   [Feature.DisableCsharpBuildless]: {
     defaultValue: false,
     envVar: "CODEQL_ACTION_DISABLE_CSHARP_BUILDLESS",
@@ -141,6 +149,11 @@ export const featureConfig: Record<
     defaultValue: false,
     envVar: "CODEQL_ACTION_EXTRACT_TOOLCACHE",
     minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysis]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS",
+    minimumVersion: CODEQL_OVERLAY_MINIMUM_VERSION,
   },
   [Feature.PythonDefaultIsToNotExtractStdlib]: {
     defaultValue: false,

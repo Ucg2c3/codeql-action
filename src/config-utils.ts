@@ -5,13 +5,19 @@ import { performance } from "perf_hooks";
 import * as yaml from "js-yaml";
 import * as semver from "semver";
 
+import { isAnalyzingPullRequest } from "./actions-util";
 import * as api from "./api-client";
 import { CachingKind, getCachingKind } from "./caching-utils";
 import { CodeQL } from "./codeql";
 import { shouldPerformDiffInformedAnalysis } from "./diff-informed-analysis-utils";
 import { Feature, FeatureEnablement } from "./feature-flags";
-import { Language, parseLanguage } from "./languages";
+import { getGitRoot, isAnalyzingDefaultBranch } from "./git-utils";
+import { isTracedLanguage, Language, parseLanguage } from "./languages";
 import { Logger } from "./logging";
+import {
+  CODEQL_OVERLAY_MINIMUM_VERSION,
+  OverlayDatabaseMode,
+} from "./overlay-database-utils";
 import { RepositoryNwo } from "./repository";
 import { downloadTrapCaches } from "./trap-caching";
 import {
@@ -19,6 +25,7 @@ import {
   prettyPrintPack,
   ConfigurationError,
   BuildMode,
+  codeQlVersionAtLeast,
 } from "./util";
 
 // Property names from the user-supplied config file.
@@ -171,6 +178,11 @@ export interface AugmentationProperties {
   queriesInput?: Array<{ uses: string }>;
 
   /**
+   * The quality queries input from the `with` block of the action declaration.
+   */
+  qualityQueriesInput?: Array<{ uses: string }>;
+
+  /**
    * Whether or not the packs input combines with the packs in the config.
    */
   packsInputCombines: boolean;
@@ -181,9 +193,26 @@ export interface AugmentationProperties {
   packsInput?: string[];
 
   /**
-   * Default query filters to apply to the queries in the config.
+   * Extra query exclusions to append to the config.
    */
-  defaultQueryFilters?: QueryFilter[];
+  extraQueryExclusions?: ExcludeQueryFilter[];
+
+  /**
+   * The overlay database mode to use.
+   */
+  overlayDatabaseMode: OverlayDatabaseMode;
+
+  /**
+   * Whether to use caching for overlay databases. If it is true, the action
+   * will upload the created overlay-base database to the actions cache, and
+   * download an overlay-base database from the actions cache before it creates
+   * a new overlay database. If it is false, the action assumes that the
+   * workflow will be responsible for managing database storage and retrieval.
+   *
+   * This property has no effect unless `overlayDatabaseMode` is `Overlay` or
+   * `OverlayBase`.
+   */
+  useOverlayDatabaseCaching: boolean;
 }
 
 /**
@@ -195,7 +224,10 @@ export const defaultAugmentationProperties: AugmentationProperties = {
   packsInputCombines: false,
   packsInput: undefined,
   queriesInput: undefined,
-  defaultQueryFilters: [],
+  qualityQueriesInput: undefined,
+  extraQueryExclusions: [],
+  overlayDatabaseMode: OverlayDatabaseMode.None,
+  useOverlayDatabaseCaching: false,
 };
 export type Packs = Partial<Record<Language, string[]>>;
 
@@ -405,6 +437,7 @@ export async function getRawLanguages(
 export interface InitConfigInputs {
   languagesInput: string | undefined;
   queriesInput: string | undefined;
+  qualityQueriesInput: string | undefined;
   packsInput: string | undefined;
   configFile: string | undefined;
   dbLocation: string | undefined;
@@ -419,6 +452,7 @@ export interface InitConfigInputs {
   tempDir: string;
   codeql: CodeQL;
   workspacePath: string;
+  sourceRoot: string;
   githubVersion: GitHubVersion;
   apiDetails: api.GitHubApiCombinedDetails;
   features: FeatureEnablement;
@@ -440,6 +474,7 @@ type LoadConfigInputs = Omit<InitConfigInputs, "configInput"> & {
 export async function getDefaultConfig({
   languagesInput,
   queriesInput,
+  qualityQueriesInput,
   packsInput,
   buildModeInput,
   dbLocation,
@@ -451,6 +486,7 @@ export async function getDefaultConfig({
   repository,
   tempDir,
   codeql,
+  sourceRoot,
   githubVersion,
   features,
   logger,
@@ -471,10 +507,14 @@ export async function getDefaultConfig({
 
   const augmentationProperties = await calculateAugmentation(
     codeql,
+    repository,
     features,
     packsInput,
     queriesInput,
+    qualityQueriesInput,
     languages,
+    sourceRoot,
+    buildMode,
     logger,
   );
 
@@ -528,6 +568,7 @@ async function downloadCacheWithTime(
 async function loadConfig({
   languagesInput,
   queriesInput,
+  qualityQueriesInput,
   packsInput,
   buildModeInput,
   configFile,
@@ -541,6 +582,7 @@ async function loadConfig({
   tempDir,
   codeql,
   workspacePath,
+  sourceRoot,
   githubVersion,
   apiDetails,
   features,
@@ -580,10 +622,14 @@ async function loadConfig({
 
   const augmentationProperties = await calculateAugmentation(
     codeql,
+    repository,
     features,
     packsInput,
     queriesInput,
+    qualityQueriesInput,
     languages,
+    sourceRoot,
+    buildMode,
     logger,
   );
 
@@ -620,12 +666,15 @@ async function loadConfig({
  * the config file sent to the CLI.
  *
  * @param codeql The CodeQL object.
+ * @param repository The repository to analyze.
  * @param features The feature enablement object.
  * @param rawPacksInput The packs input from the action configuration.
  * @param rawQueriesInput The queries input from the action configuration.
  * @param languages The languages that the config file is for. If the packs input
  *    is non-empty, then there must be exactly one language. Otherwise, an
  *    error is thrown.
+ * @param sourceRoot The source root of the repository.
+ * @param buildMode The build mode to use.
  * @param logger The logger to use for logging.
  *
  * @returns The properties that need to be augmented in the config file.
@@ -636,10 +685,14 @@ async function loadConfig({
 // exported for testing.
 export async function calculateAugmentation(
   codeql: CodeQL,
+  repository: RepositoryNwo,
   features: FeatureEnablement,
   rawPacksInput: string | undefined,
   rawQueriesInput: string | undefined,
+  rawQualityQueriesInput: string | undefined,
   languages: Language[],
+  sourceRoot: string,
+  buildMode: BuildMode | undefined,
   logger: Logger,
 ): Promise<AugmentationProperties> {
   const packsInputCombines = shouldCombine(rawPacksInput);
@@ -653,10 +706,31 @@ export async function calculateAugmentation(
     rawQueriesInput,
     queriesInputCombines,
   );
+  const { overlayDatabaseMode, useOverlayDatabaseCaching } =
+    await getOverlayDatabaseMode(
+      codeql,
+      repository,
+      features,
+      languages,
+      sourceRoot,
+      buildMode,
+      logger,
+    );
+  logger.info(
+    `Using overlay database mode: ${overlayDatabaseMode} ` +
+      `${useOverlayDatabaseCaching ? "with" : "without"} caching.`,
+  );
 
-  const defaultQueryFilters: QueryFilter[] = [];
+  const qualityQueriesInput = parseQueriesFromInput(
+    rawQualityQueriesInput,
+    false,
+  );
+
+  const extraQueryExclusions: ExcludeQueryFilter[] = [];
   if (await shouldPerformDiffInformedAnalysis(codeql, features, logger)) {
-    defaultQueryFilters.push({ exclude: { tags: "exclude-from-incremental" } });
+    extraQueryExclusions.push({
+      exclude: { tags: "exclude-from-incremental" },
+    });
   }
 
   return {
@@ -664,7 +738,10 @@ export async function calculateAugmentation(
     packsInput: packsInput?.[languages[0]],
     queriesInput,
     queriesInputCombines,
-    defaultQueryFilters,
+    qualityQueriesInput,
+    extraQueryExclusions,
+    overlayDatabaseMode,
+    useOverlayDatabaseCaching,
   };
 }
 
@@ -689,6 +766,118 @@ function parseQueriesFromInput(
     );
   }
   return trimmedInput.split(",").map((query) => ({ uses: query.trim() }));
+}
+
+/**
+ * Calculate and validate the overlay database mode and caching to use.
+ *
+ * - If the environment variable `CODEQL_OVERLAY_DATABASE_MODE` is set, use it.
+ *   In this case, the workflow is responsible for managing database storage and
+ *   retrieval, and the action will not perform overlay database caching. Think
+ *   of it as a "manual control" mode where the calling workflow is responsible
+ *   for making sure that everything is set up correctly.
+ * - Otherwise, if `Feature.OverlayAnalysis` is enabled, calculate the mode
+ *   based on what we are analyzing. Think of it as a "automatic control" mode
+ *   where the action will do the right thing by itself.
+ *   - If we are analyzing a pull request, use `Overlay` with caching.
+ *   - If we are analyzing the default branch, use `OverlayBase` with caching.
+ * - Otherwise, use `None`.
+ *
+ * For `Overlay` and `OverlayBase`, the function performs further checks and
+ * reverts to `None` if any check should fail.
+ *
+ * @returns An object containing the overlay database mode and whether the
+ * action should perform overlay-base database caching.
+ */
+export async function getOverlayDatabaseMode(
+  codeql: CodeQL,
+  repository: RepositoryNwo,
+  features: FeatureEnablement,
+  languages: Language[],
+  sourceRoot: string,
+  buildMode: BuildMode | undefined,
+  logger: Logger,
+): Promise<{
+  overlayDatabaseMode: OverlayDatabaseMode;
+  useOverlayDatabaseCaching: boolean;
+}> {
+  let overlayDatabaseMode = OverlayDatabaseMode.None;
+  let useOverlayDatabaseCaching = false;
+
+  const modeEnv = process.env.CODEQL_OVERLAY_DATABASE_MODE;
+  // Any unrecognized CODEQL_OVERLAY_DATABASE_MODE value will be ignored and
+  // treated as if the environment variable was not set.
+  if (
+    modeEnv === OverlayDatabaseMode.Overlay ||
+    modeEnv === OverlayDatabaseMode.OverlayBase ||
+    modeEnv === OverlayDatabaseMode.None
+  ) {
+    overlayDatabaseMode = modeEnv;
+    logger.info(
+      `Setting overlay database mode to ${overlayDatabaseMode} ` +
+        "from the CODEQL_OVERLAY_DATABASE_MODE environment variable.",
+    );
+  } else if (
+    // TODO: Remove the repository owner check once support for overlay analysis
+    // stabilizes, and no more backward-incompatible changes are expected.
+    ["github", "dsp-testing"].includes(repository.owner) &&
+    (await features.getValue(Feature.OverlayAnalysis, codeql))
+  ) {
+    if (isAnalyzingPullRequest()) {
+      overlayDatabaseMode = OverlayDatabaseMode.Overlay;
+      useOverlayDatabaseCaching = true;
+      logger.info(
+        `Setting overlay database mode to ${overlayDatabaseMode} ` +
+          "with caching because we are analyzing a pull request.",
+      );
+    } else if (await isAnalyzingDefaultBranch()) {
+      overlayDatabaseMode = OverlayDatabaseMode.OverlayBase;
+      useOverlayDatabaseCaching = true;
+      logger.info(
+        `Setting overlay database mode to ${overlayDatabaseMode} ` +
+          "with caching because we are analyzing the default branch.",
+      );
+    }
+  }
+
+  const nonOverlayAnalysis = {
+    overlayDatabaseMode: OverlayDatabaseMode.None,
+    useOverlayDatabaseCaching: false,
+  };
+
+  if (overlayDatabaseMode === OverlayDatabaseMode.None) {
+    return nonOverlayAnalysis;
+  }
+
+  if (buildMode !== BuildMode.None && languages.some(isTracedLanguage)) {
+    logger.warning(
+      `Cannot build an ${overlayDatabaseMode} database because ` +
+        `build-mode is set to "${buildMode}" instead of "none". ` +
+        "Falling back to creating a normal full database instead.",
+    );
+    return nonOverlayAnalysis;
+  }
+  if (!(await codeQlVersionAtLeast(codeql, CODEQL_OVERLAY_MINIMUM_VERSION))) {
+    logger.warning(
+      `Cannot build an ${overlayDatabaseMode} database because ` +
+        `the CodeQL CLI is older than ${CODEQL_OVERLAY_MINIMUM_VERSION}. ` +
+        "Falling back to creating a normal full database instead.",
+    );
+    return nonOverlayAnalysis;
+  }
+  if ((await getGitRoot(sourceRoot)) === undefined) {
+    logger.warning(
+      `Cannot build an ${overlayDatabaseMode} database because ` +
+        `the source root "${sourceRoot}" is not inside a git repository. ` +
+        "Falling back to creating a normal full database instead.",
+    );
+    return nonOverlayAnalysis;
+  }
+
+  return {
+    overlayDatabaseMode,
+    useOverlayDatabaseCaching,
+  };
 }
 
 /**

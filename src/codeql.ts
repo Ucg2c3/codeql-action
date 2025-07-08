@@ -87,7 +87,6 @@ export interface CodeQL {
     sourceRoot: string,
     processName: string | undefined,
     qlconfigFile: string | undefined,
-    overlayDatabaseMode: OverlayDatabaseMode,
     logger: Logger,
   ): Promise<void>;
   /**
@@ -157,9 +156,15 @@ export interface CodeQL {
     dbName: string,
   ): Promise<void>;
   /**
-   * Run 'codeql database run-queries'.
+   * Run 'codeql database run-queries'. If no `queries` are specified, then the CLI
+   * will automatically use the `config-queries.qls` (if it exists) or default queries
+   * for the language.
    */
-  databaseRunQueries(databasePath: string, flags: string[]): Promise<void>;
+  databaseRunQueries(
+    databasePath: string,
+    flags: string[],
+    queries?: string[],
+  ): Promise<void>;
   /**
    * Run 'codeql database interpret-results'.
    */
@@ -280,7 +285,7 @@ let cachedCodeQL: CodeQL | undefined = undefined;
  * The version flags below can be used to conditionally enable certain features
  * on versions newer than this.
  */
-const CODEQL_MINIMUM_VERSION = "2.15.5";
+const CODEQL_MINIMUM_VERSION = "2.16.6";
 
 /**
  * This version will shortly become the oldest version of CodeQL that the Action will run with.
@@ -558,7 +563,6 @@ export async function getCodeQLForCmd(
       sourceRoot: string,
       processName: string | undefined,
       qlconfigFile: string | undefined,
-      overlayDatabaseMode: OverlayDatabaseMode,
       logger: Logger,
     ) {
       const extraArgs = config.languages.map(
@@ -568,20 +572,6 @@ export async function getCodeQLForCmd(
         extraArgs.push("--begin-tracing");
         extraArgs.push(...(await getTrapCachingExtractorConfigArgs(config)));
         extraArgs.push(`--trace-process-name=${processName}`);
-      }
-
-      if (config.languages.indexOf(Language.actions) >= 0) {
-        // We originally added an embedded version of the Actions extractor to the CodeQL Action
-        // itself in order to deploy the extractor between CodeQL releases. When we did add the
-        // extractor to the CLI, though, its autobuild script was missing the execute bit.
-        // 2.20.6 is the first CLI release with the fully-functional extractor in the CLI. For older
-        // versions, we'll keep using the embedded extractor. We can remove the embedded extractor
-        // once 2.20.6 is deployed in the runner images.
-        if (!(await util.codeQlVersionAtLeast(codeql, "2.20.6"))) {
-          extraArgs.push("--search-path");
-          const extractorPath = path.resolve(__dirname, "../actions-extractor");
-          extraArgs.push(extractorPath);
-        }
       }
 
       const codeScanningConfigFile = await generateCodeScanningConfig(
@@ -596,10 +586,7 @@ export async function getCodeQLForCmd(
         extraArgs.push("--external-repository-token-stdin");
       }
 
-      if (
-        config.buildMode !== undefined &&
-        (await this.supportsFeature(ToolsFeature.BuildModeOption))
-      ) {
+      if (config.buildMode !== undefined) {
         extraArgs.push(`--build-mode=${config.buildMode}`);
       }
       if (qlconfigFile !== undefined) {
@@ -613,6 +600,8 @@ export async function getCodeQLForCmd(
         ? "--force-overwrite"
         : "--overwrite";
 
+      const overlayDatabaseMode =
+        config.augmentationProperties.overlayDatabaseMode;
       if (overlayDatabaseMode === OverlayDatabaseMode.Overlay) {
         const overlayChangesFile = await writeOverlayChangesFile(
           config,
@@ -823,6 +812,7 @@ export async function getCodeQLForCmd(
     async databaseRunQueries(
       databasePath: string,
       flags: string[],
+      queries: string[] = [],
     ): Promise<void> {
       const codeqlArgs = [
         "database",
@@ -832,6 +822,7 @@ export async function getCodeQLForCmd(
         "--intra-layer-parallelism",
         "--min-disk-free=1024", // Try to leave at least 1GB free
         "-v",
+        ...queries,
         ...getExtraOptionsFromEnv(["database", "run-queries"], {
           ignoringOptions: ["--expect-discarded-cache"],
         }),
@@ -1276,8 +1267,12 @@ async function generateCodeScanningConfig(
   }
 
   augmentedConfig["query-filters"] = [
-    ...(config.augmentationProperties.defaultQueryFilters || []),
+    // Ordering matters. If the first filter is an inclusion, it implicitly
+    // excludes all queries that are not included. If it is an exclusion,
+    // it implicitly includes all queries that are not excluded. So user
+    // filters (if any) should always be first to preserve intent.
     ...(augmentedConfig["query-filters"] || []),
+    ...(config.augmentationProperties.extraQueryExclusions || []),
   ];
   if (augmentedConfig["query-filters"]?.length === 0) {
     delete augmentedConfig["query-filters"];

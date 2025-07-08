@@ -36,14 +36,16 @@ import { Feature, featureConfig, Features } from "./feature-flags";
 import {
   checkInstallPython311,
   cleanupDatabaseClusterDirectory,
-  getOverlayDatabaseMode,
   initCodeQL,
   initConfig,
   runInit,
 } from "./init";
 import { Language } from "./languages";
 import { getActionsLogger, Logger } from "./logging";
-import { OverlayDatabaseMode } from "./overlay-database-utils";
+import {
+  downloadOverlayBaseDatabaseFromCache,
+  OverlayDatabaseMode,
+} from "./overlay-database-utils";
 import { getRepositoryNwo } from "./repository";
 import { ToolsSource } from "./setup-codeql";
 import {
@@ -60,7 +62,6 @@ import {
   checkDiskUsage,
   checkForTimeout,
   checkGitHubVersionInRange,
-  checkSipEnablement,
   codeQlVersionAtLeast,
   DEFAULT_DEBUG_ARTIFACT_NAME,
   DEFAULT_DEBUG_DATABASE_NAME,
@@ -298,6 +299,14 @@ async function run() {
 
   const configFile = getOptionalInput("config-file");
 
+  // path.resolve() respects the intended semantics of source-root. If
+  // source-root is relative, it is relative to the GITHUB_WORKSPACE. If
+  // source-root is absolute, it is used as given.
+  const sourceRoot = path.resolve(
+    getRequiredEnvParam("GITHUB_WORKSPACE"),
+    getOptionalInput("source-root") || "",
+  );
+
   try {
     const statusReportBase = await createStatusReportBase(
       ActionName.Init,
@@ -340,39 +349,36 @@ async function run() {
     }
     core.endGroup();
 
-    config = await initConfig(
-      {
-        languagesInput: getOptionalInput("languages"),
-        queriesInput: getOptionalInput("queries"),
-        packsInput: getOptionalInput("packs"),
-        buildModeInput: getOptionalInput("build-mode"),
-        configFile,
-        dbLocation: getOptionalInput("db-location"),
-        configInput: getOptionalInput("config"),
-        trapCachingEnabled: getTrapCachingEnabled(),
-        dependencyCachingEnabled: getDependencyCachingEnabled(),
-        // Debug mode is enabled if:
-        // - The `init` Action is passed `debug: true`.
-        // - Actions step debugging is enabled (e.g. by [enabling debug logging for a rerun](https://docs.github.com/en/actions/managing-workflow-runs/re-running-workflows-and-jobs#re-running-all-the-jobs-in-a-workflow),
-        //   or by setting the `ACTIONS_STEP_DEBUG` secret to `true`).
-        debugMode: getOptionalInput("debug") === "true" || core.isDebug(),
-        debugArtifactName:
-          getOptionalInput("debug-artifact-name") ||
-          DEFAULT_DEBUG_ARTIFACT_NAME,
-        debugDatabaseName:
-          getOptionalInput("debug-database-name") ||
-          DEFAULT_DEBUG_DATABASE_NAME,
-        repository: repositoryNwo,
-        tempDir: getTemporaryDirectory(),
-        codeql,
-        workspacePath: getRequiredEnvParam("GITHUB_WORKSPACE"),
-        githubVersion: gitHubVersion,
-        apiDetails,
-        features,
-        logger,
-      },
+    config = await initConfig({
+      languagesInput: getOptionalInput("languages"),
+      queriesInput: getOptionalInput("queries"),
+      qualityQueriesInput: getOptionalInput("quality-queries"),
+      packsInput: getOptionalInput("packs"),
+      buildModeInput: getOptionalInput("build-mode"),
+      configFile,
+      dbLocation: getOptionalInput("db-location"),
+      configInput: getOptionalInput("config"),
+      trapCachingEnabled: getTrapCachingEnabled(),
+      dependencyCachingEnabled: getDependencyCachingEnabled(),
+      // Debug mode is enabled if:
+      // - The `init` Action is passed `debug: true`.
+      // - Actions step debugging is enabled (e.g. by [enabling debug logging for a rerun](https://docs.github.com/en/actions/managing-workflow-runs/re-running-workflows-and-jobs#re-running-all-the-jobs-in-a-workflow),
+      //   or by setting the `ACTIONS_STEP_DEBUG` secret to `true`).
+      debugMode: getOptionalInput("debug") === "true" || core.isDebug(),
+      debugArtifactName:
+        getOptionalInput("debug-artifact-name") || DEFAULT_DEBUG_ARTIFACT_NAME,
+      debugDatabaseName:
+        getOptionalInput("debug-database-name") || DEFAULT_DEBUG_DATABASE_NAME,
+      repository: repositoryNwo,
+      tempDir: getTemporaryDirectory(),
       codeql,
-    );
+      workspacePath: getRequiredEnvParam("GITHUB_WORKSPACE"),
+      sourceRoot,
+      githubVersion: gitHubVersion,
+      apiDetails,
+      features,
+      logger,
+    });
 
     await checkInstallPython311(config.languages, codeql);
   } catch (unwrappedError) {
@@ -395,20 +401,38 @@ async function run() {
   }
 
   try {
-    const sourceRoot = path.resolve(
-      getRequiredEnvParam("GITHUB_WORKSPACE"),
-      getOptionalInput("source-root") || "",
-    );
+    if (
+      config.augmentationProperties.overlayDatabaseMode ===
+        OverlayDatabaseMode.Overlay &&
+      config.augmentationProperties.useOverlayDatabaseCaching
+    ) {
+      // OverlayDatabaseMode.Overlay comes in two flavors: with database
+      // caching, or without. The flavor with database caching is intended to be
+      // an "automatic control" mode, which is supposed to be fail-safe. If we
+      // cannot download an overlay-base database, we revert to
+      // OverlayDatabaseMode.None so that the workflow can continue to run.
+      //
+      // The flavor without database caching is intended to be a "manual
+      // control" mode, where the workflow is supposed to make all the
+      // necessary preparations. So, in that mode, we would assume that
+      // everything is in order and let the analysis fail if that turns out not
+      // to be the case.
+      const overlayDatabaseDownloaded =
+        await downloadOverlayBaseDatabaseFromCache(codeql, config, logger);
+      if (!overlayDatabaseDownloaded) {
+        config.augmentationProperties.overlayDatabaseMode =
+          OverlayDatabaseMode.None;
+        logger.info(
+          "No overlay-base database found in cache, " +
+            `reverting overlay database mode to ${OverlayDatabaseMode.None}.`,
+        );
+      }
+    }
 
-    const overlayDatabaseMode = await getOverlayDatabaseMode(
-      (await codeql.getVersion()).version,
-      config,
-      sourceRoot,
-      logger,
-    );
-    logger.info(`Using overlay database mode: ${overlayDatabaseMode}`);
-
-    if (overlayDatabaseMode !== OverlayDatabaseMode.Overlay) {
+    if (
+      config.augmentationProperties.overlayDatabaseMode !==
+      OverlayDatabaseMode.Overlay
+    ) {
       cleanupDatabaseClusterDirectory(config, logger);
     }
 
@@ -593,8 +617,11 @@ async function run() {
       core.exportVariable(bmnVar, value);
     }
 
-    // Set CODEQL_ENABLE_EXPERIMENTAL_FEATURES for rust
-    if (config.languages.includes(Language.rust)) {
+    // For rust: set CODEQL_ENABLE_EXPERIMENTAL_FEATURES, unless codeql already supports rust without it
+    if (
+      config.languages.includes(Language.rust) &&
+      !(await codeql.resolveLanguages()).rust
+    ) {
       const feat = Feature.RustAnalysis;
       const minVer = featureConfig[feat].minimumVersion as string;
       const envVar = "CODEQL_ENABLE_EXPERIMENTAL_FEATURES";
@@ -623,32 +650,11 @@ async function run() {
       await downloadDependencyCaches(config.languages, logger);
     }
 
-    // For CLI versions <2.15.1, build tracing caused errors in macOS ARM machines with
-    // System Integrity Protection (SIP) disabled.
-    if (
-      !(await codeQlVersionAtLeast(codeql, "2.15.1")) &&
-      process.platform === "darwin" &&
-      (process.arch === "arm" || process.arch === "arm64") &&
-      !(await checkSipEnablement(logger))
-    ) {
-      logger.warning(
-        "CodeQL versions 2.15.0 and lower are not supported on macOS ARM machines with System Integrity Protection (SIP) disabled.",
-      );
-    }
-
-    // From 2.16.0 the default for the python extractor is to not perform any
-    // dependency extraction. For versions before that, you needed to set this flag to
-    // enable this behavior.
-
+    // Suppress warnings about disabled Python library extraction.
     if (await codeQlVersionAtLeast(codeql, "2.17.1")) {
       // disabled by default, no warning
-    } else if (await codeQlVersionAtLeast(codeql, "2.16.0")) {
-      // disabled by default, prints warning if environment variable is not set
-      core.exportVariable(
-        "CODEQL_EXTRACTOR_PYTHON_DISABLE_LIBRARY_EXTRACTION",
-        "true",
-      );
     } else {
+      // disabled by default, prints warning if environment variable is not set
       core.exportVariable(
         "CODEQL_EXTRACTOR_PYTHON_DISABLE_LIBRARY_EXTRACTION",
         "true",
@@ -698,7 +704,6 @@ async function run() {
       "Runner.Worker.exe",
       getOptionalInput("registries"),
       apiDetails,
-      overlayDatabaseMode,
       logger,
     );
     if (tracerConfig !== undefined) {
